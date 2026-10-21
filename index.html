@@ -72,7 +72,9 @@ td,th{padding:7px 12px;border-bottom:1px solid #dde2ee}th{color:var(--mute);font
 .scanner-card{width:min(520px,96vw);max-height:calc(100dvh - 32px);overflow:auto;display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px;background:#f8faff;border:2px solid #fff;border-radius:22px;box-shadow:0 18px 55px rgba(0,0,0,.25);text-align:center}
 .scanner-card h3{margin:0;font-size:clamp(20px,4vw,27px)}
 .scanner-video-frame{position:relative;width:min(440px,84vw);aspect-ratio:4/3;overflow:hidden;border-radius:16px;background:#0b1020;border:2px solid #dbe2ef}
-.scanner-video-frame video{width:100%;height:100%;object-fit:cover;display:block}
+.scanner-video-frame video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#05070b;z-index:0}
+.scanner-video-frame video::-webkit-media-controls{display:none!important}
+.scanner-guide{z-index:1}
 .scanner-guide{position:absolute;left:17%;top:13%;width:66%;height:74%;border:3px solid #3ce0a2;border-radius:18px;box-shadow:0 0 0 999px rgba(4,8,16,.12);pointer-events:none}
 #scannerStatus{max-width:440px}
 .scanner-card .row{width:100%;gap:8px}
@@ -149,7 +151,7 @@ td,th{padding:7px 12px;border-bottom:1px solid #dde2ee}th{color:var(--mute);font
   <section class="scanner-card">
     <h3 id="scannerTitle">Scan QR code</h3>
     <p id="scannerStatus" class="step-subtitle" aria-live="polite">Allow camera access, then point it at the other player's QR.</p>
-    <div class="scanner-video-frame"><video id="scannerVideo" muted playsinline autoplay></video><div class="scanner-guide" aria-hidden="true"></div></div>
+    <div class="scanner-video-frame"><video id="scannerVideo" muted playsinline webkit-playsinline autoplay aria-label="Live camera preview"></video><div class="scanner-guide" aria-hidden="true"></div></div>
     <div id="scannerFallback" hidden>
       <label class="code-label" for="scannerFallbackInput">Manual fallback (only if camera scanning is unavailable)</label>
       <textarea class="code-box" id="scannerFallbackInput" placeholder="Paste or type the full QR payload" autocomplete="off" spellcheck="false"></textarea>
@@ -1683,19 +1685,54 @@ async function startScanner(target){
   stopScanner(true);scanTarget=target;$('scannerOverlay').hidden=false;$('scannerFallback').hidden=true;$('scannerFallbackInput').value='';$('scannerStatus').classList.remove('warn');
   $('scannerTitle').textContent=target==='hostReply'?'Scan the guest reply QR':'Scan the host invite QR';
   $('scannerStatus').textContent='Requesting camera access…';$('scannerShowFallback').textContent='Manual fallback';
+
+  // Call getUserMedia directly from this user-initiated button action BEFORE
+  // checking BarcodeDetector. Older browsers were returning early here, so
+  // they never asked for camera permission at all.
   if(!navigator.mediaDevices||typeof navigator.mediaDevices.getUserMedia!=='function'){
-    revealManualFallback('This page cannot access a camera in the current context. Use HTTPS/localhost or the manual fallback.');return;
-  }
-  if(typeof window.BarcodeDetector!=='function'){
-    revealManualFallback('This browser does not have built-in QR detection. Try a recent Chrome or Edge browser, or use the manual fallback.');return;
+    revealManualFallback('Camera access is unavailable in this browser or page context. Open the GitHub Pages HTTPS URL directly (not an embedded preview), check browser permissions, or use the manual fallback.');return;
   }
   try{
-    scanDetector=new BarcodeDetector({formats:['qr_code']});
-    scanStream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
-    const video=$('scannerVideo');video.srcObject=scanStream;await video.play();
+    const cameraRequest=navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
+    scanStream=await cameraRequest;
+    const video=$('scannerVideo');
+    // Attach the stream before testing QR-decoder support. Keep the camera
+    // running if the browser cannot decode QR codes natively: stopping it here
+    // used to clear srcObject, leaving a black preview even though permission
+    // had been granted.
+    video.muted=true;video.autoplay=true;video.playsInline=true;
+    video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
+    video.srcObject=scanStream;
+    await new Promise((resolve,reject)=>{
+      if(video.readyState>=1&&video.videoWidth>0){resolve();return}
+      let settled=false;
+      const done=(err)=>{if(settled)return;settled=true;clearTimeout(timer);video.removeEventListener('loadedmetadata',onMeta);video.removeEventListener('error',onError);err?reject(err):resolve()};
+      const onMeta=()=>done();
+      const onError=()=>done(new Error('The camera started, but the video preview could not be loaded.'));
+      const timer=setTimeout(()=>done(new Error('The camera permission was granted, but no video preview arrived. Close other camera apps and try again.')),6000);
+      video.addEventListener('loadedmetadata',onMeta,{once:true});video.addEventListener('error',onError,{once:true});
+    });
+    await video.play();
+
+    // The permission prompt now occurs consistently where camera access is
+    // available. Native QR decoding is still browser-dependent. Do not stop
+    // or detach the live stream when this API is missing, so the user can at
+    // least see the camera and use the explicit code fallback.
+    if(typeof window.BarcodeDetector!=='function'){
+      revealManualFallback('Live camera preview is active, but this browser has no built-in QR decoder. Keep the other player’s QR in view; use Manual fallback to paste the code, or try a browser that supports BarcodeDetector.');return;
+    }
+    scanDetector=new window.BarcodeDetector({formats:['qr_code']});
     $('scannerStatus').textContent='Camera ready. Center the other player’s QR inside the green frame.';
     scheduleScan(180);
-  }catch(err){stopScanner(false);revealManualFallback(err&&err.name==='NotAllowedError'?'Camera permission was denied. Allow camera access in your browser settings, or use the manual fallback.':'Could not start the camera. Check browser permissions and camera availability, or use the manual fallback.');}
+  }catch(err){
+    stopScanner(false);
+    let reason='Could not start the camera. Check browser permissions and camera availability, or use the manual fallback.';
+    if(err&&err.name==='NotAllowedError')reason='Camera permission was denied or blocked. Allow camera access for this GitHub Pages site in your browser settings, then press Scan again.';
+    else if(err&&err.name==='NotFoundError')reason='No camera was found on this device. Connect a camera or use the manual fallback.';
+    else if(err&&err.name==='NotReadableError')reason='The camera is busy in another app. Close other camera apps and try again.';
+    else if(err&&err.name==='SecurityError')reason='The browser blocked camera access. Open the game through its HTTPS GitHub Pages URL and try again.';
+    revealManualFallback(reason);
+  }
 }
 function scheduleScan(delay){if(scanTimer)clearTimeout(scanTimer);scanTimer=setTimeout(scanFrame,delay||180)}
 async function scanFrame(){
