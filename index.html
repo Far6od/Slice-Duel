@@ -65,24 +65,27 @@ td,th{padding:7px 12px;border-bottom:1px solid #dde2ee}th{color:var(--mute);font
 #wizard .hint{font-size:12px}
 @keyframes paneInFromRight{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:translateX(0)}}
 @keyframes paneInFromLeft{from{opacity:0;transform:translateX(-18px)}to{opacity:1;transform:translateX(0)}}
-@media(max-width:520px){.step-pane{padding:12px;gap:10px}.step-pane .row{flex-direction:column;align-items:stretch}.step-pane button{width:100%}.wizard-stack{min-height:0}.qr-frame{width:min(260px,76vw)}}
+@media(max-width:520px){.step-pane{padding:12px;gap:10px}.step-pane .row{flex-direction:column;align-items:stretch}.step-pane button{width:100%}.wizard-stack{min-height:0}.qr-frame{width:min(360px,92vw)}}
 @media(prefers-reduced-motion:reduce){.progress-fill{transition:none}.step-pane.active.forward,.step-pane.active.backwards{animation:none}}
 .scanner-overlay{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(17,24,39,.72);overflow:auto}
 .scanner-overlay[hidden]{display:none!important}
 .scanner-card{width:min(520px,96vw);max-height:calc(100dvh - 32px);overflow:auto;display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px;background:#f8faff;border:2px solid #fff;border-radius:22px;box-shadow:0 18px 55px rgba(0,0,0,.25);text-align:center}
 .scanner-card h3{margin:0;font-size:clamp(20px,4vw,27px)}
-.scanner-video-frame{position:relative;width:min(440px,84vw);aspect-ratio:4/3;overflow:hidden;border-radius:16px;background:#0b1020;border:2px solid #dbe2ef}
+.scanner-video-frame{position:relative;width:min(440px,84vw);aspect-ratio:1;overflow:hidden;border-radius:16px;background:#0b1020;border:2px solid #dbe2ef}
 .scanner-video-frame video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#05070b;z-index:0}
 .scanner-video-frame video::-webkit-media-controls{display:none!important}
-.scanner-guide{z-index:1}
-.scanner-guide{position:absolute;left:17%;top:13%;width:66%;height:74%;border:3px solid #3ce0a2;border-radius:18px;box-shadow:0 0 0 999px rgba(4,8,16,.12);pointer-events:none}
+/* This visible guide matches the actual region extracted for QR decoding. */
+.scanner-guide{position:absolute;left:10%;top:10%;width:80%;height:80%;border:4px solid #3ce0a2;border-radius:15px;box-shadow:0 0 0 999px rgba(4,8,16,.18),0 0 18px rgba(60,224,162,.3);pointer-events:none;z-index:1;animation:scannerGuidePulse 1.8s ease-in-out infinite}
+.scanner-guide:after{content:"";position:absolute;left:5%;right:5%;top:6%;height:2px;background:#b5ffe2;box-shadow:0 0 10px 2px rgba(60,224,162,.85);animation:scannerSweep 2.4s ease-in-out infinite alternate}
+@keyframes scannerSweep{from{top:6%}to{top:94%}}
+@keyframes scannerGuidePulse{0%,100%{border-color:#3ce0a2}50%{border-color:#b5ffe2}}
 #scannerStatus{max-width:440px}
 .scanner-card .row{width:100%;gap:8px}
 .scanner-card button{font-size:15px;padding:10px 16px}
 .scanner-card #scannerFallback{width:100%;display:flex;flex-direction:column;align-items:center;gap:10px}
 .scanner-card #scannerFallback[hidden]{display:none!important}
 @media(max-width:520px){.scanner-card{padding:12px;gap:10px}.scanner-card .row{flex-direction:column;align-items:stretch}.scanner-card button{width:100%}.scanner-video-frame{width:min(390px,85vw)}}
-@media(prefers-reduced-motion:reduce){.scanner-overlay{transition:none}}
+@media(prefers-reduced-motion:reduce){.scanner-overlay{transition:none}.scanner-guide,.scanner-guide:after{animation:none}}
 
 </style>
 </head>
@@ -1663,87 +1666,170 @@ function paintQR(canvas,text,status){
     catch(err){try{if(status){status.textContent='Could not schedule QR drawing. Use Copy Code.';status.classList.add('warn')}}catch(_e){}finish(false)}
   });
 }
-/* Camera scanner. The built-in BarcodeDetector is used where available; all
-   camera and decoding errors are surfaced in the overlay instead of blocking input. */
-let scanStream=null,scanTimer=0,scanTarget='',scanDetector=null,scanBusy=false;
+/* Camera scanner. The guide is also a real region of interest (ROI), not only decoration.
+   Native BarcodeDetector is preferred, with jsQR fallback for browsers that need it. */
+let scanStream=null,scanTimer=0,scanTarget='',scanDetector=null,scanDecoder=null,scanBusy=false,scanLastHint=0,scanLoadPromise=null,scanNativeMisses=0,scanDecoderRequested=false,scanDecoderUnavailable=false,scanFrameCount=0;
+const scanCanvas=document.createElement('canvas');
+const scanCanvasCtx=scanCanvas.getContext('2d',{willReadFrequently:true});
 function stopScanner(hideOverlay=true){
   if(scanTimer){clearTimeout(scanTimer);scanTimer=0}
   const video=$('scannerVideo');
   try{if(video)video.pause()}catch(_e){}
   try{if(video)video.srcObject=null}catch(_e){}
   if(scanStream){try{scanStream.getTracks().forEach(track=>track.stop())}catch(_e){}}
-  scanStream=null;scanDetector=null;scanBusy=false;
+  scanStream=null;scanDetector=null;scanDecoder=null;scanBusy=false;scanLastHint=0;scanNativeMisses=0;scanDecoderRequested=false;scanDecoderUnavailable=false;scanFrameCount=0;
   if(hideOverlay)$('scannerOverlay').hidden=true;
 }
 function revealManualFallback(reason){
   $('scannerFallback').hidden=false;
-  $('scannerStatus').textContent=reason||'Camera scanning is unavailable here. Use the manual fallback, or open the game in a browser with QR detection support.';
+  $('scannerStatus').textContent=reason||'Automatic QR scanning is unavailable. You can retry the camera or use the optional manual fallback.';
   $('scannerStatus').classList.add('warn');
   $('scannerShowFallback').textContent='Hide manual fallback';
+}
+function loadJsQR(){
+  if(typeof window.jsQR==='function')return Promise.resolve(window.jsQR);
+  if(scanLoadPromise)return scanLoadPromise;
+  // Fallback is loaded only when the browser's native scanner is missing or misses repeatedly.
+  const sources=[
+    'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js',
+    'https://unpkg.com/jsqr@1.4.0/dist/jsQR.js'
+  ];
+  scanLoadPromise=(async()=>{
+    let lastError=null;
+    for(const src of sources){
+      try{
+        await new Promise((resolve,reject)=>{
+          const script=document.createElement('script');script.src=src;script.async=true;script.crossOrigin='anonymous';
+          script.onload=()=>{script.remove();typeof window.jsQR==='function'?resolve():reject(new Error('QR decoder loaded but did not initialize.'))};
+          script.onerror=()=>{script.remove();reject(new Error('Could not load QR decoder from '+new URL(src).hostname+'.'))};
+          document.head.appendChild(script);
+        });
+        if(typeof window.jsQR==='function')return window.jsQR;
+      }catch(e){lastError=e}
+    }
+    scanLoadPromise=null;
+    throw new Error('This browser has no working native QR detection and the fallback decoder could not load. Check the internet connection or try a browser with built-in QR scanning. '+(lastError&&lastError.message?lastError.message:''));
+  })();
+  return scanLoadPromise;
 }
 async function startScanner(target){
   stopScanner(true);scanTarget=target;$('scannerOverlay').hidden=false;$('scannerFallback').hidden=true;$('scannerFallbackInput').value='';$('scannerStatus').classList.remove('warn');
   $('scannerTitle').textContent=target==='hostReply'?'Scan the guest reply QR':'Scan the host invite QR';
   $('scannerStatus').textContent='Requesting camera access…';$('scannerShowFallback').textContent='Manual fallback';
-
-  // Call getUserMedia directly from this user-initiated button action BEFORE
-  // checking BarcodeDetector. Older browsers were returning early here, so
-  // they never asked for camera permission at all.
   if(!navigator.mediaDevices||typeof navigator.mediaDevices.getUserMedia!=='function'){
-    revealManualFallback('Camera access is unavailable in this browser or page context. Open the GitHub Pages HTTPS URL directly (not an embedded preview), check browser permissions, or use the manual fallback.');return;
+    revealManualFallback('Camera access is unavailable in this browser or page context. Open the GitHub Pages HTTPS URL directly, check browser permissions, or use the optional manual fallback.');return;
   }
   try{
-    const cameraRequest=navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
-    scanStream=await cameraRequest;
-    const video=$('scannerVideo');
-    // Attach the stream before testing QR-decoder support. Keep the camera
-    // running if the browser cannot decode QR codes natively: stopping it here
-    // used to clear srcObject, leaving a black preview even though permission
-    // had been granted.
-    video.muted=true;video.autoplay=true;video.playsInline=true;
-    video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');
-    video.srcObject=scanStream;
+    scanStream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:24,max:30}}});
+    const video=$('scannerVideo');video.muted=true;video.autoplay=true;video.playsInline=true;
+    video.setAttribute('playsinline','');video.setAttribute('webkit-playsinline','');video.srcObject=scanStream;
     await new Promise((resolve,reject)=>{
       if(video.readyState>=1&&video.videoWidth>0){resolve();return}
       let settled=false;
       const done=(err)=>{if(settled)return;settled=true;clearTimeout(timer);video.removeEventListener('loadedmetadata',onMeta);video.removeEventListener('error',onError);err?reject(err):resolve()};
-      const onMeta=()=>done();
-      const onError=()=>done(new Error('The camera started, but the video preview could not be loaded.'));
-      const timer=setTimeout(()=>done(new Error('The camera permission was granted, but no video preview arrived. Close other camera apps and try again.')),6000);
+      const onMeta=()=>done();const onError=()=>done(new Error('The camera started, but the video preview could not be loaded.'));
+      const timer=setTimeout(()=>done(new Error('Camera permission was granted, but no video preview arrived. Close other camera apps and retry.')),6000);
       video.addEventListener('loadedmetadata',onMeta,{once:true});video.addEventListener('error',onError,{once:true});
     });
     await video.play();
-
-    // The permission prompt now occurs consistently where camera access is
-    // available. Native QR decoding is still browser-dependent. Do not stop
-    // or detach the live stream when this API is missing, so the user can at
-    // least see the camera and use the explicit code fallback.
-    if(typeof window.BarcodeDetector!=='function'){
-      revealManualFallback('Live camera preview is active, but this browser has no built-in QR decoder. Keep the other player’s QR in view; use Manual fallback to paste the code, or try a browser that supports BarcodeDetector.');return;
+    // Use continuous autofocus on cameras that expose it; ignore unsupported constraints.
+    try{
+      const track=scanStream.getVideoTracks()[0];
+      const caps=track&&track.getCapabilities?track.getCapabilities():null;
+      if(track&&track.applyConstraints&&caps&&Array.isArray(caps.focusMode)&&caps.focusMode.includes('continuous')){
+        track.applyConstraints({advanced:[{focusMode:'continuous'}]}).catch(()=>{});
+      }
+    }catch(_e){}
+    if(typeof window.BarcodeDetector==='function'){
+      try{scanDetector=new window.BarcodeDetector({formats:['qr_code']})}catch(_e){scanDetector=null}
     }
-    scanDetector=new window.BarcodeDetector({formats:['qr_code']});
-    $('scannerStatus').textContent='Camera ready. Center the other player’s QR inside the green frame.';
-    scheduleScan(180);
+    if(!scanDetector){
+      $('scannerStatus').textContent='Preparing automatic QR scanner… Keep the full QR inside the green square.';
+      scanDecoder=await loadJsQR();
+    }
+    $('scannerStatus').textContent='Scanning automatically… Center the other device’s QR inside the green square and hold steady.';
+    $('scannerStatus').classList.remove('warn');scheduleScan(80);
   }catch(err){
-    stopScanner(false);
-    let reason='Could not start the camera. Check browser permissions and camera availability, or use the manual fallback.';
-    if(err&&err.name==='NotAllowedError')reason='Camera permission was denied or blocked. Allow camera access for this GitHub Pages site in your browser settings, then press Scan again.';
-    else if(err&&err.name==='NotFoundError')reason='No camera was found on this device. Connect a camera or use the manual fallback.';
-    else if(err&&err.name==='NotReadableError')reason='The camera is busy in another app. Close other camera apps and try again.';
-    else if(err&&err.name==='SecurityError')reason='The browser blocked camera access. Open the game through its HTTPS GitHub Pages URL and try again.';
+    const cameraStillActive=!!(scanStream&&scanStream.getTracks().some(track=>track.readyState==='live'));
+    if(!cameraStillActive)stopScanner(false);
+    let reason=err&&err.message?err.message:'Could not start automatic scanning. Check camera permissions, or retry.';
+    if(err&&err.name==='NotAllowedError')reason='Camera permission was denied or blocked. Allow camera access for this GitHub Pages site, then press Scan again.';
+    else if(err&&err.name==='NotFoundError')reason='No camera was found on this device.';
+    else if(err&&err.name==='NotReadableError')reason='The camera is busy in another app. Close other camera apps and retry.';
+    else if(err&&err.name==='SecurityError')reason='The browser blocked camera access. Open the game through its HTTPS GitHub Pages URL.';
     revealManualFallback(reason);
   }
 }
-function scheduleScan(delay){if(scanTimer)clearTimeout(scanTimer);scanTimer=setTimeout(scanFrame,delay||180)}
+function maybeLoadDecoderFallback(){
+  scanNativeMisses++;
+  if(scanNativeMisses<8||scanDecoderRequested||scanDecoderUnavailable||!scanDetector)return;
+  scanDecoderRequested=true;
+  $('scannerStatus').textContent='Trying the compatibility scanner… Keep the QR inside the green square.';
+  loadJsQR().then(decoder=>{
+    if($('scannerOverlay').hidden||!scanStream)return;
+    scanDecoder=decoder;scanNativeMisses=0;
+    $('scannerStatus').textContent='Automatic scanner ready. Keep the QR inside the green square.';
+    $('scannerStatus').classList.remove('warn');scheduleScan(40);
+  }).catch(err=>{
+    scanDecoderUnavailable=true;
+    if(!$('scannerOverlay').hidden&&scanStream){
+      $('scannerStatus').textContent='Still trying the browser scanner. If it cannot read the QR, the compatibility decoder could not load; check your connection and try again. '+(err&&err.message?err.message:'');
+      $('scannerStatus').classList.add('warn');
+    }
+  }).finally(()=>{scanDecoderRequested=false});
+}
+function scheduleScan(delay){if(scanTimer)clearTimeout(scanTimer);scanTimer=setTimeout(scanFrame,delay||220)}
+function drawScannerRegion(video,fullFrame){
+  const vw=video.videoWidth,vh=video.videoHeight;
+  let sx=0,sy=0,sw=vw,sh=vh;
+  if(!fullFrame){
+    // Match object-fit:cover in the square preview, then crop the same 80% inner guide shown in CSS.
+    const frame=video.parentElement.getBoundingClientRect();
+    const boxAspect=(frame.width||320)/(frame.height||320),sourceAspect=vw/vh;
+    let visibleW=vw,visibleH=vh,visibleX=0,visibleY=0;
+    if(sourceAspect>boxAspect){visibleW=vh*boxAspect;visibleX=(vw-visibleW)/2}
+    else{visibleH=vw/boxAspect;visibleY=(vh-visibleH)/2}
+    const inset=.10,span=.80;
+    sx=visibleX+visibleW*inset;sy=visibleY+visibleH*inset;sw=visibleW*span;sh=visibleH*span;
+  }
+  // Preserve native pixels and cap cost on high-resolution phone cameras.
+  const scale=Math.min(1,960/Math.max(sw,sh));
+  const w=Math.max(1,Math.round(sw*scale)),h=Math.max(1,Math.round(sh*scale));
+  if(scanCanvas.width!==w)scanCanvas.width=w;if(scanCanvas.height!==h)scanCanvas.height=h;
+  scanCanvasCtx.imageSmoothingEnabled=false;
+  scanCanvasCtx.drawImage(video,sx,sy,sw,sh,0,0,w,h);
+}
 async function scanFrame(){
-  scanTimer=0;if($('scannerOverlay').hidden||!scanStream||!scanDetector||scanBusy)return;
-  const video=$('scannerVideo');
-  if(!video||video.readyState<2||!video.videoWidth){scheduleScan(250);return}
+  scanTimer=0;if($('scannerOverlay').hidden||!scanStream||(!scanDetector&&!scanDecoder)||scanBusy)return;
+  const video=$('scannerVideo');if(!video||video.readyState<2||!video.videoWidth){scheduleScan(250);return}
   try{
-    const found=await scanDetector.detect(video);
-    if(found&&found.length&&found[0].rawValue){scanBusy=true;const payload=found[0].rawValue;await acceptScannedCode(payload,scanTarget);scanBusy=false;}
-  }catch(e){$('scannerStatus').textContent='Still scanning… Keep the entire QR inside the frame and hold steady.'}
-  if(!$('scannerOverlay').hidden&&scanStream&&!scanBusy)scheduleScan(180);
+    let payload='';
+    // Scan the bordered area most of the time; every fourth pass also checks the full frame.
+    const fullFrame=(++scanFrameCount%4===0);
+    drawScannerRegion(video,fullFrame);
+    if(scanDetector){
+      try{const found=await scanDetector.detect(scanCanvas);if(found&&found.length)payload=found[0].rawValue||''}catch(_e){/* Try JS decoder below if it is available. */}
+    }
+    if(!payload&&scanDecoder&&scanCanvasCtx){
+      const pixels=scanCanvasCtx.getImageData(0,0,scanCanvas.width,scanCanvas.height);
+      const decoded=scanDecoder(pixels.data,scanCanvas.width,scanCanvas.height,{inversionAttempts:'attemptBoth'});
+      if(decoded&&decoded.data)payload=decoded.data;
+    }
+    if(payload){
+      scanNativeMisses=0;scanBusy=true;$('scannerStatus').textContent='QR detected. Checking the Slice Duel connection code…';
+      await acceptScannedCode(payload,scanTarget);scanBusy=false;
+    }else{
+      if(scanDetector&&!scanDecoder)maybeLoadDecoderFallback();
+      if(Date.now()-scanLastHint>2600){
+        scanLastHint=Date.now();$('scannerStatus').textContent='Scanning automatically… Fit the entire QR within the green square, move closer, avoid glare, and hold steady.';
+      }
+    }
+  }catch(e){
+    scanBusy=false;
+    if(scanDetector&&!scanDecoder)maybeLoadDecoderFallback();
+    if(Date.now()-scanLastHint>2600){scanLastHint=Date.now();$('scannerStatus').textContent='Could not decode this frame yet. Keep the full QR straight, bright and inside the green square.'}
+  }
+  if(!$('scannerOverlay').hidden&&scanStream&&!scanBusy&&(scanDetector||scanDecoder))scheduleScan(220);
 }
 async function acceptScannedCode(payload,target){
   try{
